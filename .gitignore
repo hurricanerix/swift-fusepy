@@ -7,7 +7,7 @@
 *.egg
 *.egg-info
 dist
-build
+uild
 eggs
 parts
 bin
@@ -29,6 +29,9 @@ nosetests.xml
 
 # Translations
 *.mo
+
+# vim
+*.swp
 
 # Mr Developer
 .mr.developer.cfg
