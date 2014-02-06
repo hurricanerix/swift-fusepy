@@ -24,8 +24,12 @@
 
 import argparse
 import os
+import pyrax
 
 from fuse import FUSE, Operations
+
+
+__version__ = '0.0.1'
 
 
 class SwiftFusePy(Operations):
@@ -33,16 +37,71 @@ class SwiftFusePy(Operations):
     FUSE file system to mount a Swift container.
     """
 
-    def __init__(self, credentials_file, container_name):
+    def __init__(self, identity_type, credentials_file, container_name):
         """
+        @param identity_type: type of identity to use.
+        @type identity_type: string
         @param credentials_file: absolute path to the file containing the
                                  credentials required to auth with swift.
         @type credentials_file: string
         @param container_name: name of the container to be mounted.
         @type container_name: string
         """
+        self.identity_type = identity_type
         self.credentials_file = credentials_file
         self.container_name = container_name
+        self.container = None
+
+    def _get_container(self, reauth=False):
+        """
+        Get the container to be mounted.
+
+        @param reauth: if True, re-authenticate, otherwise returned the
+                       previously retrieved container object.
+        @type reauth: boolean
+        """
+        if not self.container or reauth:
+            pyrax.set_setting("identity_type", self.identity_type)
+            pyrax.set_setting('custom_user_agent',
+                              'Swift-FusePy/{0}'.format(__version__))
+            pyrax.set_credential_file(self.credentials_file)
+            self.container = pyrax.cloudfiles.get_container(
+                self.container_name)
+        return self.container
+
+    def getattr(self, path, fh=None):
+        """
+        http://man7.org/linux/man-pages/man2/stat.2.html
+        """
+        attr = {
+            #'st_ctime': 1384464600.0,
+            #'st_mtime': 1384464600.0,
+            #'st_nlink': 40,
+            'st_mode': 17405,
+            'st_size': 1428  # size of file in bytes
+            #'st_gid': 80,
+            #'st_uid': 0,
+            #'st_atime': 1391581273.0
+        }
+        return attr
+
+    def readdir(self, path, fh):
+        container = self._get_container()
+        yield '.'
+        yield '..'
+
+        path = path.lstrip('/')
+        for obj in container.get_objects():
+            dirent = (obj.name, {
+                'st_ctime': 1384464600.0,
+                'st_mtime': 1384464600.0,
+                'st_nlink': 40,
+                'st_mode': 17405,
+                'st_size': 1428,
+                'st_gid': 80,
+                'st_uid': 0,
+                'st_atime': 1391579333.0}, 0)
+            yield dirent
 
 
 def main():
@@ -51,6 +110,8 @@ def main():
     parser.add_argument('--credentials_file', default='~/.swift.creds',
                         help='credentials file for connecting to Swift')
     parser.add_argument('--fsname', default=None, help='file system name')
+    parser.add_argument('--identity_type', default='rackspace',
+                        help='should be either \'rackspace\' or \'keystone\'')
     parser.add_argument('container_name', help='container to mount')
     parser.add_argument('mount_point',
                         help='directory to mount the container to')
@@ -61,7 +122,8 @@ def main():
     if not args.fsname:
         args.fsname = 'swift.{0}'.format(args.container_name)
 
-    FUSE(SwiftFusePy(args.credentials_file, args.container_name),
+    FUSE(SwiftFusePy(args.identity_type, args.credentials_file,
+                     args.container_name),
          args.mount_point, foreground=True, fsname=args.fsname)
 
 
