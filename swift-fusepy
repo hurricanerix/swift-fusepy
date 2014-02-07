@@ -23,11 +23,30 @@
 # SOFTWARE.
 
 import argparse
+import getpass
 import os
 import pyrax
 
+from calendar import timegm
+from datetime import datetime
 from fuse import FUSE, Operations
+from pwd import getpwnam
 
+FUSE_MODES = {
+    'IFREG': 0100000,
+    'IFDIR': 0040000,
+    'IRWXU': 00700,
+    'IRUSR': 00400,
+    'IWUSR': 00200,
+    'IXUSR': 00100,
+    'IRWXG': 00070,
+    'IRGRP': 00040,
+    'IWGRP': 00020,
+    'IXGRP': 00010,
+    'IRWXO': 00007,
+    'IROTH': 00004,
+    'IWOTH': 00002,
+    'IXOTH': 00001}
 
 __version__ = '0.0.1'
 
@@ -37,7 +56,8 @@ class SwiftFusePy(Operations):
     FUSE file system to mount a Swift container.
     """
 
-    def __init__(self, identity_type, credentials_file, container_name):
+    def __init__(self, identity_type, credentials_file, container_name,
+                 username=None):
         """
         @param identity_type: type of identity to use.
         @type identity_type: string
@@ -51,6 +71,12 @@ class SwiftFusePy(Operations):
         self.credentials_file = credentials_file
         self.container_name = container_name
         self.container = None
+        self.objects = None
+
+        if not username:
+            username = getpass.getuser()
+        self.uid = getpwnam(username).pw_uid
+        self.gid = getpwnam(username).pw_gid
 
     def _get_container(self, reauth=False):
         """
@@ -69,39 +95,163 @@ class SwiftFusePy(Operations):
                 self.container_name)
         return self.container
 
+    def _get_objects(self, refresh=False):
+        """
+        Get objects from the container.
+
+        @param refresh: If False, return a cached copy if possible, otherwise
+                        make a call to cloud files for the objects.
+        @type refresh: boolean
+
+        @return: objects retrieved from the container.
+        @rtype: dict
+        """
+        if self.objects and not refresh:
+            return self.objects
+
+        container = self._get_container()
+        objects = container.get_objects()
+
+        self.objects = {}
+
+        for obj in objects:
+            self.objects['/{0}'.format(obj.name)] = {
+                'content_type': obj.content_type,
+                'etag': obj.etag,
+                'metadata': obj.get_metadata(),
+                'st_uid': self.uid,
+                'st_gid': self.gid,
+                'st_mode': self._get_mode(ugo='r'),
+                'st_mtime': self._get_timestamp(obj.last_modified),
+                'st_size': obj.total_bytes
+            }
+
+        return self.objects
+
+    def _get_timestamp(self, date_string):
+        """
+        Convert a date string to a unix timestamp.
+
+        @param date_string: date to be converted
+        @type date_string: string
+
+        @return: unix timestamp
+        @rtype: int
+        """
+        utc = datetime.strptime(date_string, '%Y-%m-%dT%H:%M:%S')
+        return timegm(utc.utctimetuple())
+
+    def _get_mode(self, directory=False, ugo='', user='', group='', other=''):
+        """
+        Returns a mode based on inputs provided.
+
+        @param directory: If True sets flag indicating a directory, otherwise
+                          sets the flag indicating a regular file.
+        @type directory: boolean
+        @param ugo: applies permissions to all (user, group, other).
+                    acceptable values are:
+                        'r' for read access
+                        'w' for write access
+                        'x' for execute access
+        @type ugo: string
+        @param user: applies permissions to user, same available values as ugo.
+        @type user: string
+        @param group: applies permissions to group, same available values as
+                      ugo.
+        @type group: string
+        @param other: applies permissions to other, same available values as
+                      ugo.
+        @type other: string
+
+        @return: mode
+        @rtype: int
+        """
+        mode = 0
+
+        if directory:
+            mode = FUSE_MODES.get('IFDIR')
+        else:
+            mode = FUSE_MODES.get('IFREG')
+
+        if 'r' in user or 'r' in ugo:
+            mode = mode | FUSE_MODES.get('IRUSR')
+        if 'r' in group or 'r' in ugo:
+            mode = mode | FUSE_MODES.get('IRGRP')
+        if 'r' in other or 'r' in ugo:
+            mode = mode | FUSE_MODES.get('IROTH')
+
+        if 'w' in user or 'w' in ugo:
+            mode = mode | FUSE_MODES.get('IWUSR')
+        if 'w' in group or 'w' in ugo:
+            mode = mode | FUSE_MODES.get('IWGRP')
+        if 'w' in other or 'w' in ugo:
+            mode = mode | FUSE_MODES.get('IWOTH')
+
+        if 'x' in user or 'x' in ugo:
+            mode = mode | FUSE_MODES.get('IXUSR')
+        if 'x' in group or 'x' in ugo:
+            mode = mode | FUSE_MODES.get('IXGRP')
+        if 'x' in other or 'x' in ugo:
+            mode = mode | FUSE_MODES.get('IXOTH')
+
+        return mode
+
     def getattr(self, path, fh=None):
         """
-        http://man7.org/linux/man-pages/man2/stat.2.html
+        Return stat structure for the path provided.
+
+        U{stat info<http://man7.org/linux/man-pages/man2/stat.2.html>}
+
+        @param path: path to the resource to return stats for
+        @type path: string
+        @param fh: file handle
+        @type fh:
+
+        @return: stats
+        @type: dict
         """
-        attr = {
-            #'st_ctime': 1384464600.0,
-            #'st_mtime': 1384464600.0,
-            #'st_nlink': 40,
-            'st_mode': 17405,
-            'st_size': 1428  # size of file in bytes
-            #'st_gid': 80,
-            #'st_uid': 0,
-            #'st_atime': 1391581273.0
-        }
-        return attr
+        objects = self._get_objects()
+
+        if path == '/':
+            # TODO: change st_size to the bytes used by the container.
+            return {
+                'st_mtyime': 1391776835,
+                'st_uid': self.uid,
+                'st_gid': self.gid,
+                'st_mode': self._get_mode(directory=True, ugo='rx'),
+                'st_size': 0}
+
+        if path in objects:
+            obj = objects[path]
+            return {
+                'st_mtime': obj.get('st_mtime', 0),
+                'st_uid': obj.get('st_uid', 0),
+                'st_gid': obj.get('st_gid', 0),
+                'st_mode': obj.get('st_mode', 0),
+                'st_size': obj.get('st_size', 0)}
+
+        for key in objects.iterkeys():
+            if key.startswith('{0}/'.format(path)):
+                return {'st_mode': 0040775}
 
     def readdir(self, path, fh):
-        container = self._get_container()
-        yield '.'
-        yield '..'
+        """
+        Get a list of the contents of a directory.
 
-        path = path.lstrip('/')
-        for obj in container.get_objects():
-            dirent = (obj.name, {
-                'st_ctime': 1384464600.0,
-                'st_mtime': 1384464600.0,
-                'st_nlink': 40,
-                'st_mode': 17405,
-                'st_size': 1428,
-                'st_gid': 80,
-                'st_uid': 0,
-                'st_atime': 1391579333.0}, 0)
-            yield dirent
+        @param path: path to the directory to return contents of.
+        @type path: string
+        @param fh: file handle
+        @type fh:
+
+        @return: directoires/files
+        @type: list
+        """
+        objects = self._get_objects()
+
+        contents = ['.', '..']
+        for name in objects.iterkeys():
+            contents.append(name.lstrip('/'))
+        return contents
 
 
 def main():
