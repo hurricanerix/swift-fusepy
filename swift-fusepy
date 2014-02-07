@@ -23,13 +23,14 @@
 # SOFTWARE.
 
 import argparse
+import errno
 import getpass
 import os
 import pyrax
 
 from calendar import timegm
 from datetime import datetime
-from fuse import FUSE, Operations
+from fuse import FUSE, FuseOSError, Operations
 from pwd import getpwnam
 
 FUSE_MODES = {
@@ -95,33 +96,50 @@ class SwiftFusePy(Operations):
                 self.container_name)
         return self.container
 
-    def _set_swiftfs_stats(self, name, obj, swiftfs=None):
-            if swiftfs is None:
-                swiftfs = self._swiftfs
-            is_dir = False
-            if '/' in name:
-                is_dir = True
+    def _set_swiftfs_stats(self, objects):
+        """
+        Build the swiftfs from objcects retunred from pyrax.
 
-            if is_dir:
+        @param objects: list of objects
+        @type: object
+        """
+        def insert_obj(name, obj, swiftfs):
+            if '/' in name:
                 (dir_name, dir_cont) = name.split('/', 1)
-                if dir_name not in swiftfs:
-                    swiftfs[dir_name] = {
+                if dir_name not in swiftfs['contents']:
+                    swiftfs['contents'][dir_name] = {
                         'st_uid': self.uid,
                         'st_gid': self.gid,
                         'st_mode': self._get_mode(directory=True, ugo='rx'),
                         'contents': {}}
-
-                self._set_swiftfs_stats(dir_cont, obj,
-                                        swiftfs[dir_name]['contents'])
+                swiftfs = swiftfs['contents'][dir_name]
+                insert_obj(dir_cont, obj, swiftfs)
             else:
-                swiftfs[name] = {
+                swiftfs['contents'][name] = {
                     'st_uid': self.uid,
                     'st_gid': self.gid,
                     'st_mode': self._get_mode(user='r', group='r'),
                     'st_mtime': self._get_timestamp(obj.last_modified),
                     'st_size': obj.total_bytes}
+        self._swiftfs = {
+            '/': {
+                'st_uid': self.uid,
+                'st_gid': self.gid,
+                'st_mode': self._get_mode(directory=True, ugo='rx'),
+                'contents': {}}}
+        for obj in objects:
+            insert_obj(obj.name, obj, swiftfs=self._swiftfs['/'])
 
-    def _get_swiftfs(self, refresh=False):
+    def _is_dir(self, stats):
+        """
+        Tests if the stats dictionary represents a directory.
+        """
+        if not stats:
+            return False
+        return (stats.get('st_mode', 0) & FUSE_MODES.get('IFDIR') ==
+                FUSE_MODES.get('IFDIR'))
+
+    def _get_swiftfs(self, path='', refresh=False):
         """
         Get the swift file system.
 
@@ -132,18 +150,29 @@ class SwiftFusePy(Operations):
         @return: representation of swift objects.
         @rtype: dict
         """
+        def get_dir(path, swiftfs):
+            if path == '/':
+                return swiftfs['/']
+            if '/' in swiftfs:
+                path = path.lstrip('/')
+                return get_dir(path, swiftfs['/']['contents'])
+
+            if '/' in path:
+                (name, dir_cont) = path.split('/', 1)
+                return get_dir(dir_cont, swiftfs[name]['contents'])
+
+            tmp = swiftfs.get(path)
+            return tmp
+
         if self._swiftfs and not refresh:
-            return self._swiftfs
+            return get_dir(path, self._swiftfs)
 
         container = self._get_container()
         objects = container.get_objects()
 
-        self._swiftfs = {}
+        self._set_swiftfs_stats(objects)
 
-        for obj in objects:
-            self._set_swiftfs_stats(obj.name, obj)
-
-        return self._swiftfs
+        return get_dir(path, self._swiftfs)
 
     def _get_timestamp(self, date_string):
         """
@@ -227,26 +256,18 @@ class SwiftFusePy(Operations):
         @return: stats
         @type: dict
         """
-        swiftfs = self._get_swiftfs()
-        name = path.lstrip('/')
+        #attr_name = path.lstrip('/')
+        stats = self._get_swiftfs(path)
 
-        if name == '':
-            # TODO: change st_size to the bytes used by the container.
-            return {
-                'st_mtime': 1391776835,
-                'st_uid': self.uid,
-                'st_gid': self.gid,
-                'st_mode': self._get_mode(directory=True, ugo='rx'),
-                'st_size': 0}
+        if stats is None:
+            raise FuseOSError(errno.ENOENT)
 
-        if name in swiftfs:
-            f = swiftfs[name]
-            return {
-                'st_mtime': f.get('st_mtime', 0),
-                'st_uid': f.get('st_uid', 0),
-                'st_gid': f.get('st_gid', 0),
-                'st_mode': f.get('st_mode', 0),
-                'st_size': f.get('st_size', 0)}
+        return {
+            'st_mtime': stats.get('st_mtime', 0),
+            'st_uid': stats.get('st_uid', 0),
+            'st_gid': stats.get('st_gid', 0),
+            'st_mode': stats.get('st_mode', 0),
+            'st_size': stats.get('st_size', 0)}
 
     def readdir(self, path, fh):
         """
@@ -257,11 +278,11 @@ class SwiftFusePy(Operations):
         @param fh: file handle
         @type fh:
 
-        @return: directoires/files
+        @return: directories/files
         @type: list
         """
-        path = path.split('/')
-        swiftfs = self._get_swiftfs()
+        swiftfs = self._get_swiftfs(path)
+        swiftfs = swiftfs['contents']
 
         contents = ['.', '..']
         for name in swiftfs.iterkeys():
