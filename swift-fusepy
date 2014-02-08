@@ -27,6 +27,7 @@ import errno
 import getpass
 import os
 import pyrax
+import requests
 
 from calendar import timegm
 from datetime import datetime
@@ -256,7 +257,6 @@ class SwiftFusePy(Operations):
         @return: stats
         @type: dict
         """
-        #attr_name = path.lstrip('/')
         stats = self._get_swiftfs(path)
 
         if stats is None:
@@ -288,6 +288,22 @@ class SwiftFusePy(Operations):
         for name in swiftfs.iterkeys():
             contents.append(name)
         return contents
+
+    def read(self, path, length, offset, fh):
+        # Some hackery here due to pyrax not letting me (as far as I can tell)
+        # make range requests to the object.
+        token = pyrax.identity.token
+        endpoint = pyrax.cloudfiles.connection.url
+        path = path.lstrip('/')
+        url = '{0}/{1}/{2}'.format(endpoint, self.container_name, path)
+        response = requests.get(url,
+                                headers={'x-auth-token': token,
+                                         'range': 'bytes {0}-{1}'.format(
+                                             offset, length)})
+        if not response.ok:
+            raise FuseOSError(errno.EREMOTEIO)
+
+        return response.content
 
 
 def main():
