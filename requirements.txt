@@ -1,3 +1,4 @@
 fusepy
-pyrax
+python-keystoneclient
+python-swiftclient
 flake8

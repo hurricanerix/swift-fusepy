@@ -23,16 +23,17 @@
 # SOFTWARE.
 
 import argparse
+import collections
+import ConfigParser as configparser
 import errno
 import getpass
 import os
-import pyrax
-import requests
 
 from calendar import timegm
 from datetime import datetime
 from fuse import FUSE, FuseOSError, Operations
 from pwd import getpwnam
+from swiftclient import get_auth, client, ClientException
 
 FUSE_MODES = {
     'IFREG': 0100000,
@@ -58,51 +59,32 @@ class SwiftFusePy(Operations):
     FUSE file system to mount a Swift container.
     """
 
-    def __init__(self, identity_type, credentials_file, container_name,
-                 username=None):
+    def __init__(self, auth_args, container_name, owner):
         """
-        @param identity_type: type of identity to use.
-        @type identity_type: string
-        @param credentials_file: absolute path to the file containing the
-                                 credentials required to auth with swift.
-        @type credentials_file: string
+        @param auth_args: keystone arguments to be used when authing.
+        @type auth_args: dict
         @param container_name: name of the container to be mounted.
         @type container_name: string
+        @param owner: name of the user to assign ownership of the mounted
+                      container.
+        @type owner: string
         """
-        self.identity_type = identity_type
-        self.credentials_file = credentials_file
+        self.auth_args = auth_args
         self.container_name = container_name
-        self.container = None
+        self.uid = getpwnam(owner).pw_uid
+        self.gid = getpwnam(owner).pw_gid
         self._swiftfs = None
+        self.storage_url = None
+        self.token = None
 
-        if not username:
-            username = getpass.getuser()
-        self.uid = getpwnam(username).pw_uid
-        self.gid = getpwnam(username).pw_gid
-
-    def _get_container(self, reauth=False):
-        """
-        Get the container to be mounted.
-
-        @param reauth: if True, re-authenticate, otherwise returned the
-                       previously retrieved container object.
-        @type reauth: boolean
-        """
-        if not self.container or reauth:
-            pyrax.set_setting("identity_type", self.identity_type)
-            pyrax.set_setting('custom_user_agent',
-                              'Swift-FusePy/{0}'.format(__version__))
-            pyrax.set_credential_file(self.credentials_file)
-            self.container = pyrax.cloudfiles.get_container(
-                self.container_name)
-        return self.container
-
-    def _set_swiftfs_stats(self, objects):
+    def _set_swiftfs_stats(self, container_info, objects):
         """
         Build the swiftfs from objcects retunred from pyrax.
 
+        @param container_info: information about the container
+        @type container_info: dict
         @param objects: list of objects
-        @type: object
+        @type: list of dicts
         """
         def insert_obj(name, obj, swiftfs):
             if '/' in name:
@@ -120,25 +102,41 @@ class SwiftFusePy(Operations):
                     'st_uid': self.uid,
                     'st_gid': self.gid,
                     'st_mode': self._get_mode(user='r', group='r'),
-                    'st_mtime': self._get_timestamp(obj.last_modified),
-                    'st_size': obj.total_bytes}
+                    'st_mtime': self._get_timestamp(
+                        obj.get('last_modified', 0)),
+                    'st_size': int(obj.get('bytes', 0))}
         self._swiftfs = {
             '/': {
                 'st_uid': self.uid,
                 'st_gid': self.gid,
                 'st_mode': self._get_mode(directory=True, ugo='rx'),
-                'contents': {}}}
+                'contents': {},
+                'st_mtime': float(container_info.get('x-timestamp', 0)),
+                'st_size': int(container_info.get(
+                    'x-container-bytes-used', 0))}}
         for obj in objects:
-            insert_obj(obj.name, obj, swiftfs=self._swiftfs['/'])
+            insert_obj(obj.get('name'), obj, swiftfs=self._swiftfs['/'])
 
-    def _is_dir(self, stats):
+#    def _is_dir(self, stats):
+#        """
+#        Tests if the stats dictionary represents a directory.
+#        """
+#        if not stats:
+#            return False
+#        return (stats.get('st_mode', 0) & FUSE_MODES.get('IFDIR') ==
+#                FUSE_MODES.get('IFDIR'))
+
+    def auth(self, force=False):
         """
-        Tests if the stats dictionary represents a directory.
+        Authenticate and store the storage URL and token.
+
+        @param force: send the request to authenticate, even if credentials
+                      are already stored.
         """
-        if not stats:
-            return False
-        return (stats.get('st_mode', 0) & FUSE_MODES.get('IFDIR') ==
-                FUSE_MODES.get('IFDIR'))
+        if self.storage_url and self.token and not force:
+            return
+
+        (self.storage_url, self.token) = get_auth(**self.auth_args)
 
     def _get_swiftfs(self, path='', refresh=False):
         """
@@ -168,10 +166,12 @@ class SwiftFusePy(Operations):
         if self._swiftfs and not refresh:
             return get_dir(path, self._swiftfs)
 
-        container = self._get_container()
-        objects = container.get_objects()
+        self.auth()
 
-        self._set_swiftfs_stats(objects)
+        (container_info, objects) = client.get_container(
+            self.storage_url, self.token, self.container_name)
+
+        self._set_swiftfs_stats(container_info, objects)
 
         return get_dir(path, self._swiftfs)
 
@@ -185,6 +185,8 @@ class SwiftFusePy(Operations):
         @return: unix timestamp
         @rtype: int
         """
+        if '.' in date_string:
+            date_string = date_string.split('.')[0]
         utc = datetime.strptime(date_string, '%Y-%m-%dT%H:%M:%S')
         return timegm(utc.utctimetuple())
 
@@ -250,7 +252,7 @@ class SwiftFusePy(Operations):
         U{stat info<http://man7.org/linux/man-pages/man2/stat.2.html>}
 
         @param path: path to the resource to return stats for
-        @type path: string
+       @type path: string
         @param fh: file handle
         @type fh:
 
@@ -290,44 +292,50 @@ class SwiftFusePy(Operations):
         return contents
 
     def read(self, path, length, offset, fh):
-        # Some hackery here due to pyrax not letting me (as far as I can tell)
-        # make range requests to the object.
-        token = pyrax.identity.token
-        endpoint = pyrax.cloudfiles.connection.url
+        """
+        """
+        self.auth()
         path = path.lstrip('/')
-        url = '{0}/{1}/{2}'.format(endpoint, self.container_name, path)
 
-        headers = {'x-auth-token': token,
-                   'Range': 'bytes={0}-{1}'.format(
-                       offset, offset + length - 1)}
-        response = requests.get(url, headers=headers)
+        headers = {'Range': 'bytes={0}-{1}'.format(
+            offset, offset + length - 1)}
 
-        if not response.ok:
+        try:
+            (info, data) = client.get_object(self.storage_url, self.token,
+                                             self.container_name, path,
+                                             headers=headers)
+        except ClientException:
             raise FuseOSError(errno.EREMOTEIO)
 
-        return response.content
+        return data
 
 
 def main():
     parser = argparse.ArgumentParser(
         description='Mount a Swift container to your local file system')
-    parser.add_argument('--credentials_file', default='~/.swift.creds',
-                        help='credentials file for connecting to Swift')
+    parser.add_argument('--config_file', default='~/.swift.cfg',
+                        help='config file for swift-fusepy.')
     parser.add_argument('--fsname', default=None, help='file system name')
-    parser.add_argument('--identity_type', default='rackspace',
-                        help='should be either \'rackspace\' or \'keystone\'')
     parser.add_argument('container_name', help='container to mount')
     parser.add_argument('mount_point',
                         help='directory to mount the container to')
+    parser.add_argument('--owner', default=None,
+                        help='user name to assign file permissions to.')
 
     args = parser.parse_args()
-    args.credentials_file = os.path.expanduser(args.credentials_file)
+    args.config_file = os.path.expanduser(args.config_file)
+    config = configparser.SafeConfigParser(dict_type=collections.defaultdict)
+    config.readfp(open(args.config_file))
+
+    auth_args = dict(config.items('keystoneclient'))
+
+    if not args.owner:
+        args.owner = getpass.getuser()
 
     if not args.fsname:
         args.fsname = 'swift.{0}'.format(args.container_name)
 
-    FUSE(SwiftFusePy(args.identity_type, args.credentials_file,
-                     args.container_name),
+    FUSE(SwiftFusePy(auth_args, args.container_name, args.owner),
          args.mount_point, foreground=True, fsname=args.fsname)
 
 
