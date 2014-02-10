@@ -79,7 +79,7 @@ class SwiftFusePy(Operations):
 
     def _set_swiftfs_stats(self, container_info, objects):
         """
-        Build the swiftfs from objcects retunred from pyrax.
+        Build the swiftfs from the objects returned.
 
         @param container_info: information about the container
         @type container_info: dict
@@ -105,6 +105,7 @@ class SwiftFusePy(Operations):
                     'st_mtime': self._get_timestamp(
                         obj.get('last_modified', 0)),
                     'st_size': int(obj.get('bytes', 0))}
+
         self._swiftfs = {
             '/': {
                 'st_uid': self.uid,
@@ -117,16 +118,7 @@ class SwiftFusePy(Operations):
         for obj in objects:
             insert_obj(obj.get('name'), obj, swiftfs=self._swiftfs['/'])
 
-#    def _is_dir(self, stats):
-#        """
-#        Tests if the stats dictionary represents a directory.
-#        """
-#        if not stats:
-#            return False
-#        return (stats.get('st_mode', 0) & FUSE_MODES.get('IFDIR') ==
-#                FUSE_MODES.get('IFDIR'))
-
-    def auth(self, force=False):
+    def _auth(self, force=False):
         """
         Authenticate and store the storage URL and token.
 
@@ -166,7 +158,7 @@ class SwiftFusePy(Operations):
         if self._swiftfs and not refresh:
             return get_dir(path, self._swiftfs)
 
-        self.auth()
+        self._auth()
 
         (container_info, objects) = client.get_container(
             self.storage_url, self.token, self.container_name)
@@ -247,12 +239,17 @@ class SwiftFusePy(Operations):
 
     def getattr(self, path, fh=None):
         """
-        Return stat structure for the path provided.
+        Return file attributes. The "stat" structure is described in detail
+        in the stat(2) manual page. For the given pathname, this should fill
+        in the elements of the "stat" structure. If a field is meaningless
+        or semi-meaningless (e.g., st_ino) then it should be set to 0 or
+        given a "reasonable" value. This call is pretty much required for a
+        usable filesystem.
 
         U{stat info<http://man7.org/linux/man-pages/man2/stat.2.html>}
 
         @param path: path to the resource to return stats for
-       @type path: string
+        @type path: string
         @param fh: file handle
         @type fh:
 
@@ -273,7 +270,12 @@ class SwiftFusePy(Operations):
 
     def readdir(self, path, fh):
         """
-        Get a list of the contents of a directory.
+        Return one or more directory entries (struct dirent) to the caller.
+        This is one of the most complex FUSE functions. It is related to,
+        but not identical to, the readdir(2) and getdents(2) system calls,
+        and the readdir(3) library function.  Required for essentially any
+        filesystem, since it's what makes ls and a whole bunch of other things
+        work.
 
         @param path: path to the directory to return contents of.
         @type path: string
@@ -293,8 +295,12 @@ class SwiftFusePy(Operations):
 
     def read(self, path, length, offset, fh):
         """
+        Read sizebytes from the given file into the buffer buf, beginning
+        offset bytes into the file. See read(2) for full details. Returns
+        the number of bytes transferred, or 0 if offset was at or beyond the
+        end of the file. Required for any sensible filesystem.
         """
-        self.auth()
+        self._auth()
         path = path.lstrip('/')
 
         headers = {'Range': 'bytes={0}-{1}'.format(
